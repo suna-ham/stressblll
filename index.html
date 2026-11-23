@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>토마토 스트레스볼</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #9a9a96; font-family: system-ui, sans-serif; }
+  canvas { display: block; touch-action: none; }
+  #ui { position: fixed; top: 12px; left: 12px; display: flex; gap: 8px; align-items: center; }
+  button { font: inherit; padding: 8px 14px; border: 0; border-radius: 999px; background: #2b2b2b; color: #fff; cursor: pointer; }
+  #msg { color: #222; font-size: 14px; background: rgba(255,255,255,.6); padding: 4px 10px; border-radius: 8px; }
+  #impact { position: fixed; top: 12px; right: 12px; font-size: 28px; font-weight: 700; color: #b71c1c; }
+  video { position: fixed; right: 12px; bottom: 12px; width: 180px; border-radius: 12px; transform: scaleX(-1); opacity: .85; display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <button id="cam">카메라 켜기</button>
+  <button id="reset">리셋</button>
+  <button id="wipe">🧽 벽 닦기</button>
+  <span id="msg">토마토를 잡고 아래로 당겼다 놓으면 벽으로 날아가요</span>
+</div>
+<div id="impact"></div>
+<video id="video" autoplay playsinline muted></video>
+
+<script type="module">
+// ---- 튜닝 상수 (캘리브레이션 손잡이) ----
+const R = 60;               // 벽에 붙었을 때 토마토 반지름 px
+const CAM = 1000;           // 카메라~벽 거리 (원근감)
+const IDLE_Z = 550;         // 손에 들고 있을 때 벽에서 떨어진 거리
+const GRAVITY = 900;        // 날아가는 동안 아래로 떨어지는 정도
+const MIN_VZ = 1600, MAX_VZ = 4000; // 약하게 던져도 빠르게 날아가 시원하게 터지도록
+const IMPACT_K = 1 / 2600;  // 충돌속도 → 퍼짐 정도(0~1)
+const MIN_AMP = 0.6;        // 아무리 약해도 이만큼은 터짐
+const SPREAD = 1.5;         // 최대 퍼짐: 반지름 × (1 + SPREAD)
+const SPLAT_TIME = 0.12;    // 촤악 퍼지는 시간(s)
+const HOLD = 0.5;           // 퍼진 채로 붙어있는 시간(s)
+const RECOVER_TAU = 1.3;    // 회복 시간상수(s) → 약 4~5초에 원래 모양
+const MAX_PULL = 220;       // 마우스 최대 당김 px
+const PULL_POWER = 12;      // 당김 px → 날아가는 속도
+const AIM = 4;              // 당긴 반대 방향으로 조준되는 정도
+const THROW_GAIN = 1.0;     // 팔 휘두르는 속도 → 날아가는 속도
+const SWING_WINDOW = 0.35;  // 손 펴기 직전 몇 초 동안의 팔 속도로 힘을 정할지
+const Z_GAIN = 800;         // 손이 카메라 쪽으로 다가오는 속도(손 크기 변화) 가중치
+const SHAKE = 16;           // 충돌 시 화면 흔들림 px
+const FIST_ON = 1.3, FIST_OFF = 1.55; // 주먹 판정 (히스테리시스)
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const msg = document.getElementById('msg');
+const impactEl = document.getElementById('impact');
+let W = 0, H = 0, cx = 0, cy = 0, wallImg = null, stain = null, sctx = null;
+
+function makeWall() { // 회색 대리석 느낌 벽 (투명도가 보이도록)
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, W, H);
+  grd.addColorStop(0, '#b9b8b3'); grd.addColorStop(1, '#8f8e8a');
+  g.fillStyle = grd; g.fillRect(0, 0, W, H);
+  for (let i = 0; i < W * H / 60; i++) {
+    g.fillStyle = Math.random() < 0.5 ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.07)';
+    g.fillRect(Math.random() * W, Math.random() * H, 1 + Math.random() * 2, 1 + Math.random() * 2);
+  }
+  g.strokeStyle = 'rgba(255,255,255,.12)'; g.lineWidth = 1.5;
+  for (let i = 0; i < 6; i++) {
+    g.beginPath(); let x = Math.random() * W, y = Math.random() * H; g.moveTo(x, y);
+    for (let j = 0; j < 8; j++) { x += (Math.random() - .3) * 120; y += (Math.random() - .5) * 80; g.lineTo(x, y); }
+    g.stroke();
+  }
+  return c;
+}
+
+function resize() {
+  const dpr = devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight; cx = W / 2; cy = H / 2;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  wallImg = makeWall();
+  stain = document.createElement('canvas'); stain.width = W; stain.height = H; // 벽에 남는 즙 자국
+  sctx = stain.getContext('2d'); sctx.lineCap = 'round';
+}
+addEventListener('resize', resize);
+resize();
+
+// ---- 원근 투영: 벽(z=0)이 화면, z가 클수록 나에게 가까움 ----
+const scaleAt = z => CAM / (CAM - z);
+const project = b => { const s = scaleAt(b.z); return { X: cx + (b.x - cx) * s, Y: cy + (b.y - cy) * s, s }; };
+function placeAtScreen(b, X, Y) { const s = scaleAt(b.z); b.x = cx + (X - cx) / s; b.y = cy + (Y - cy) / s; }
+
+// phase: idle(손에 듦) | held(손 모션으로 잡음) | flying | stuck(벽에 붙음)
+const ball = { x: 0, y: 0, z: IDLE_Z, vx: 0, vy: 0, vz: 0, phase: 'idle', t: 0, amp: 0, noise: [], bubbles: [] };
+const makeBubbles = () => Array.from({ length: 9 }, () => ({ a: Math.random() * 6.28, r: 0.2 + Math.random() * 0.6, s: 1.5 + Math.random() * 3.5 }));
+function reset() {
+  Object.assign(ball, { z: IDLE_Z, vx: 0, vy: 0, vz: 0, phase: 'idle', t: 0, amp: 0, bubbles: makeBubbles() });
+  placeAtScreen(ball, cx, H * 0.72);
+}
+reset();
+
+// ---- 물리 ----
+function step(b, dt) {
+  if (b.phase === 'stuck') { b.t += dt; return; }
+  if (b.phase !== 'flying') return;
+  b.vy += GRAVITY * dt;
+  b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+  b.x = Math.min(Math.max(b.x, R), (W || 1000) - R);
+  b.y = Math.min(Math.max(b.y, R), (H || 1000) - R);
+  if (b.z <= 0) {
+    const impact = -b.vz;
+    b.z = 0; b.phase = 'stuck'; b.t = 0;
+    b.amp = Math.min(Math.max(impact * IMPACT_K, MIN_AMP), 1);
+    b.noise = Array.from({ length: 5 }, () => ({ k: 3 + Math.floor(Math.random() * 7), a: 0.05 + Math.random() * 0.1, p: Math.random() * 6.28 }));
+    if (b === ball) onImpact(impact, b.x, b.y); // 자가 점검용 가짜 공은 효과 없음
+  }
+}
+
+// 0 = 동그란 토마토, 1 = 최대로 퍼짐
+function splatAmount(b) {
+  if (b.phase !== 'stuck') return 0;
+  const u = Math.min(b.t / SPLAT_TIME, 1) - 1;
+  const easeOutBack = 1 + 2.7 * u * u * u + 1.7 * u * u; // 촤악 — 살짝 넘쳤다가 자리잡음
+  const decay = b.t < HOLD ? 1 : Math.exp(-(b.t - HOLD) / RECOVER_TAU);
+  return b.amp * easeOutBack * decay;
+}
+
+function throwBall(vx, vy, vz) {
+  ball.vx = vx; ball.vy = vy;
+  ball.vz = -Math.min(Math.max(vz, MIN_VZ), MAX_VZ);
+  ball.phase = 'flying';
+}
+
+let shake = 0, flash = 0, audio = null;
+const drops = [], drips = [];
+function onImpact(v, x, y) {
+  impactEl.textContent = Math.round(v / 10) + ' 💥';
+  const k = Math.max(Math.min(v * IMPACT_K, 1), MIN_AMP);
+  shake = SHAKE * k; flash = 0.35 * k;
+  // 즙 튀기: 사방으로 날아가며 벽에 줄무늬 자국을 남김
+  for (let i = 0, n = 40 + 80 * k; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = (300 + Math.random() * 1600) * k;
+    const seed = Math.random() < 0.12;
+    drops.push({ x: x + Math.cos(a) * R * 0.8, y: y + Math.sin(a) * R * 0.8, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      r: seed ? 3 : 2 + Math.random() * 7 * k, seed });
+  }
+  if (!audio) return;
+  const o = audio.createOscillator(), og = audio.createGain(); // 퍽 하는 저음
+  o.frequency.setValueAtTime(140, audio.currentTime); o.frequency.exponentialRampToValueAtTime(40, audio.currentTime + 0.2);
+  og.gain.setValueAtTime(0.8 * k, audio.currentTime); og.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + 0.25);
+  o.connect(og).connect(audio.destination); o.start(); o.stop(audio.currentTime + 0.3);
+  // 철퍽: 감쇠하는 노이즈를 로우패스로 뭉개기
+  const len = audio.sampleRate * 0.3, buf = audio.createBuffer(1, len, audio.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (len * 0.15));
+  const src = audio.createBufferSource(), lp = audio.createBiquadFilter(), g = audio.createGain();
+  src.buffer = buf; lp.type = 'lowpass'; lp.frequency.value = 500 + 900 * k; g.gain.value = 0.3 + 0.7 * k;
+  src.connect(lp).connect(g).connect(audio.destination); src.start();
+}
+const initAudio = () => { audio ??= new AudioContext(); };
+
+let wipeX = null; // 닦는 와이퍼의 x 위치 (null = 안 닦는 중)
+function updateJuice(dt) {
+  if (wipeX !== null) {
+    wipeX += 2200 * dt;
+    sctx.clearRect(0, 0, wipeX, H);
+    for (const arr of [drops, drips]) for (let i = arr.length - 1; i >= 0; i--) if (arr[i].x < wipeX) arr.splice(i, 1);
+    if (wipeX > W + 40) wipeX = null;
+  }
+  for (let i = drops.length - 1; i >= 0; i--) {
+    const d = drops[i], px = d.x, py = d.y, f = Math.exp(-dt * 7);
+    d.vx *= f; d.vy *= f; d.x += d.vx * dt; d.y += d.vy * dt; // 벽에 달라붙음: 중력 없음 (흘러내림은 drips 담당)
+    const col = d.seed ? 'rgba(240,220,150,.9)' : 'rgba(185,15,15,.6)';
+    const sp = Math.hypot(d.vx, d.vy);
+    sctx.strokeStyle = col; sctx.lineWidth = d.r * Math.min(1, 150 / (sp + 1)) + 0.8; // 빠를수록 가는 줄
+    sctx.beginPath(); sctx.moveTo(px, py); sctx.lineTo(d.x, d.y); sctx.stroke();
+    if (sp < 40) {
+      sctx.fillStyle = col; sctx.beginPath(); sctx.arc(d.x, d.y, d.r * 0.6, 0, Math.PI * 2); sctx.fill(); // 떨어진 방울
+      if (!d.seed && d.r > 5 && Math.random() < 0.2) drips.push({ x: d.x, y: d.y, w: d.r * 0.5, life: 0.6 + Math.random() * 1.2 });
+      drops.splice(i, 1);
+    }
+  }
+  for (let i = drips.length - 1; i >= 0; i--) { // 주르륵 흘러내림
+    const d = drips[i], py = d.y;
+    d.y += 30 * dt * d.life; d.life -= dt; d.w *= 0.99;
+    sctx.strokeStyle = 'rgba(180,10,10,.35)'; sctx.lineWidth = d.w;
+    sctx.beginPath(); sctx.moveTo(d.x, py); sctx.lineTo(d.x, d.y); sctx.stroke();
+    if (d.life <= 0) drips.splice(i, 1);
+  }
+  // ponytail: 자국은 아주 천천히 옅어짐. 계속 남기고 싶으면 이 줄 삭제
+  sctx.globalCompositeOperation = 'destination-out'; sctx.fillStyle = `rgba(0,0,0,${dt * 0.06})`;
+  sctx.fillRect(0, 0, W, H); sctx.globalCompositeOperation = 'source-over';
+}
+
+// ---- 그리기 ----
+function tomatoPath(X, Y, s, amt, b) {
+  const n = 72, pts = [], now = performance.now() / 1000;
+  // 젤리 출렁: 붙는 순간 크게 떨리고, 들고 있을 땐 살짝 말랑말랑 숨쉬듯
+  const jig = b.phase === 'stuck' ? 0.06 * Math.exp(-b.t * 3.5) : 0.018;
+  const jt = b.phase === 'stuck' ? b.t * 20 : now * 5;
+  for (let i = 0; i < n; i++) {
+    const th = (i / n) * Math.PI * 2;
+    let noise = 0;
+    for (const q of b.noise) noise += q.a * Math.sin(q.k * th + q.p);
+    const wob = 1 + jig * (Math.sin(2 * th + jt) + 0.5 * Math.sin(3 * th - jt * 1.3));
+    const r = R * s * wob * (1 + 0.03 * Math.sin(5 * th) + amt * SPREAD * (1 + noise * 1.6));
+    pts.push([X + Math.cos(th) * r, Y + Math.sin(th) * r]);
+  }
+  ctx.beginPath();
+  const mid = (a, c) => [(a[0] + c[0]) / 2, (a[1] + c[1]) / 2];
+  let m = mid(pts[n - 1], pts[0]); ctx.moveTo(m[0], m[1]);
+  for (let i = 0; i < n; i++) { const p = pts[i], q = mid(p, pts[(i + 1) % n]); ctx.quadraticCurveTo(p[0], p[1], q[0], q[1]); }
+  ctx.closePath();
+}
+
+const radial = (x, y, r0, r1, stops) => {
+  const g = ctx.createRadialGradient(x, y, r0, x, y, r1);
+  stops.forEach(([o, c]) => g.addColorStop(o, c)); return g;
+};
+
+// ponytail: 스킨 시스템 없음. 얼굴로 바꿀 때 ③ 색 입히기 단계만 drawImage(faceImg)로 교체.
+function drawTomato(X, Y, s, amt, b) {
+  const size = R * s * (1 + amt * SPREAD), rr = R * s;
+  const thin = 1 - 0.45 * amt; // 퍼질수록 얇아져 더 비침
+  const box = [X - size * 2, Y - size * 2, size * 4, size * 4];
+
+  // ① 벽에 붙었을 때: 빛이 젤리를 통과해 생기는 붉은 그림자
+  if (b.phase === 'stuck') {
+    ctx.save(); tomatoPath(X + 6, Y + 10, s, amt, b);
+    ctx.shadowColor = 'rgba(150,0,0,.5)'; ctx.shadowBlur = 30 * s; ctx.fillStyle = 'rgba(120,0,0,.25)'; ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.save(); tomatoPath(X, Y, s, amt, b); ctx.clip();
+  // ② 굴절: 뒤의 벽이 볼록렌즈처럼 살짝 확대돼 비쳐 보임
+  const lens = 1.18 - 0.1 * amt;
+  ctx.save(); ctx.translate(X, Y); ctx.scale(lens, lens); ctx.translate(-X, -Y);
+  ctx.drawImage(wallImg, -SHAKE, -SHAKE, W + SHAKE * 2, H + SHAKE * 2); ctx.drawImage(stain, 0, 0, W, H);
+  ctx.restore();
+  // ③ 색 입히기: 곱하기로 벽 무늬는 남기고 빨갛게 물들임. 가장자리일수록 두꺼워 진함(프레넬)
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.fillStyle = radial(X - size * 0.1, Y - size * 0.1, 0, size * 1.05,
+    [[0, 'rgb(255,185,175)'], [0.55, 'rgb(250,95,85)'], [1, 'rgb(175,20,30)']]);
+  ctx.fillRect(...box);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = radial(X, Y, 0, size * 1.02,
+    [[0, 'rgba(225,35,30,0)'], [0.7, `rgba(205,20,25,${0.3 * thin})`], [1, `rgba(130,0,15,${0.7 * thin})`]]);
+  ctx.fillRect(...box);
+  // ④ 속빛(서브서피스): 왼쪽 위에서 들어온 빛이 오른쪽 아래로 빠져나가며 은은하게 빛남
+  ctx.globalCompositeOperation = 'screen';
+  ctx.fillStyle = radial(X + size * 0.3, Y + size * 0.35, 0, size * 0.8, [[0, 'rgba(255,140,110,.55)'], [1, 'rgba(255,80,60,0)']]);
+  ctx.fillRect(...box);
+  ctx.globalCompositeOperation = 'source-over';
+  // ⑤ 안쪽 테두리 그늘 + 갇힌 기포
+  ctx.lineWidth = rr * 0.22; ctx.strokeStyle = `rgba(110,0,10,${0.25 * thin})`;
+  tomatoPath(X, Y, s, amt, b); ctx.stroke();
+  for (const q of b.bubbles) {
+    const bx = X + Math.cos(q.a) * size * q.r * 0.85, by = Y + Math.sin(q.a) * size * q.r * 0.85, br = q.s * s;
+    ctx.fillStyle = 'rgba(255,190,180,.18)'; ctx.strokeStyle = 'rgba(255,230,225,.55)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.9)';
+    ctx.beginPath(); ctx.arc(bx - br * 0.35, by - br * 0.35, br * 0.25, 0, Math.PI * 2); ctx.fill();
+  }
+  // ⑥ 표면 반사: 넓고 부드러운 광 + 또렷한 하이라이트 + 반대편 작은 반사
+  const hx = X - size * 0.35, hy = Y - size * 0.4;
+  ctx.fillStyle = radial(hx, hy, 0, rr * 0.9, [[0, 'rgba(255,255,255,.35)'], [1, 'rgba(255,255,255,0)']]);
+  ctx.fillRect(...box);
+  ctx.save(); ctx.translate(hx, hy); ctx.rotate(-0.7);
+  ctx.fillStyle = radial(0, 0, 0, rr * 0.3, [[0, 'rgba(255,255,255,.95)'], [0.5, 'rgba(255,255,255,.8)'], [1, 'rgba(255,255,255,0)']]);
+  ctx.scale(1, 0.5); ctx.beginPath(); ctx.arc(0, 0, rr * 0.3, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = 'rgba(255,255,255,.7)';
+  ctx.beginPath(); ctx.arc(X + size * 0.45, Y + size * 0.5, rr * 0.05, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  // ⑦ 바깥 윤곽: 아래쪽은 빛이 모여 밝은 테
+  tomatoPath(X, Y, s, amt, b);
+  ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(90,0,0,.45)'; ctx.stroke();
+  ctx.save(); ctx.clip();
+  ctx.fillStyle = radial(X + size * 0.2, Y + size * 1.1, size * 0.4, size * 0.75, [[0, 'rgba(255,200,180,0)'], [0.85, 'rgba(255,200,180,.35)'], [1, 'rgba(255,200,180,0)']]);
+  ctx.fillRect(...box);
+  ctx.restore();
+  drawStem(X, Y, s);
+}
+
+function drawStem(X, Y, s) { // 꼭지는 위에서 본 모양, 퍼지지 않음
+  const L = R * s * 0.55;
+  ctx.save(); ctx.translate(X, Y);
+  ctx.fillStyle = '#1f3d1a';
+  for (let i = 0; i < 5; i++) {
+    const a = i * (Math.PI * 2 / 5) - Math.PI / 2, ca = Math.cos(a), sa = Math.sin(a);
+    const tipX = ca * L, tipY = sa * L, w = L * 0.1;
+    ctx.beginPath();
+    ctx.moveTo(-sa * w, ca * w);
+    ctx.quadraticCurveTo(tipX * 0.6 + ca * 2 - sa * w * 0.6, tipY * 0.6 + sa * 2 + ca * w * 0.6, tipX - sa * 3, tipY + ca * 3); // 끝이 살짝 휨
+    ctx.quadraticCurveTo(tipX * 0.6 + sa * w * 0.6, tipY * 0.6 - ca * w * 0.6, sa * w, -ca * w);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#2f5a24';
+  ctx.beginPath(); ctx.arc(0, 0, L * 0.18, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function draw() {
+  ctx.save();
+  if (shake > 0.3) { ctx.translate((Math.random() - .5) * shake * 2, (Math.random() - .5) * shake * 2); shake *= 0.85; }
+  ctx.drawImage(wallImg, -SHAKE, -SHAKE, W + SHAKE * 2, H + SHAKE * 2);
+  ctx.drawImage(stain, 0, 0, W, H);
+  if (wipeX !== null) { // 고무 와이퍼
+    ctx.fillStyle = 'rgba(255,255,255,.12)'; ctx.fillRect(wipeX - 60, 0, 60, H); // 젖은 자국
+    ctx.fillStyle = '#2b2b2b'; ctx.fillRect(wipeX, 0, 16, H);
+    ctx.fillStyle = '#f2b705'; ctx.fillRect(wipeX + 16, 0, 10, H);
+  }
+  const p = project(ball);
+  if (ball.phase !== 'stuck') { // 벽에 드리운 그림자: 가까워질수록 진하고 작아짐
+    const k = 1 - ball.z / IDLE_Z;
+    ctx.fillStyle = `rgba(0,0,0,${0.08 + 0.22 * k})`;
+    ctx.beginPath(); ctx.ellipse(ball.x + 10, ball.y + 14, R * (1.4 - 0.4 * k), R * (1.4 - 0.4 * k), 0, 0, Math.PI * 2); ctx.fill();
+  }
+  if (drag) {
+    const pull = Math.hypot(p.X - drag.ax, p.Y - drag.ay) / MAX_PULL;
+    ctx.strokeStyle = '#5a3a22'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(drag.ax, drag.ay); ctx.lineTo(p.X, p.Y); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.fillRect(drag.ax - 60, drag.ay - R * 3, 120, 12);
+    ctx.fillStyle = `hsl(${120 - pull * 120},80%,45%)`; ctx.fillRect(drag.ax - 60, drag.ay - R * 3, 120 * pull, 12);
+  }
+  drawTomato(p.X, p.Y, p.s, splatAmount(ball), ball);
+
+  if (hand.visible) {
+    if (hand.hist.length > 1) { // 휘두르는 궤적
+      ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+      ctx.beginPath(); hand.hist.forEach((h, i) => i ? ctx.lineTo(h.x, h.y) : ctx.moveTo(h.x, h.y)); ctx.stroke();
+    }
+    if (ball.phase === 'held') { // 팔 스윙 파워 게이지
+      const pw = swingPower();
+      ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.fillRect(hand.x - 60, hand.y - R * 3, 120, 12);
+      ctx.fillStyle = `hsl(${120 - pw * 120},80%,45%)`; ctx.fillRect(hand.x - 60, hand.y - R * 3, 120 * pw, 12);
+    }
+    ctx.strokeStyle = hand.fist ? '#c62828' : '#fff'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(hand.x, hand.y, hand.fist ? 18 : 28, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+  if (flash > 0.01) { ctx.fillStyle = `rgba(220,0,0,${flash})`; ctx.fillRect(0, 0, W, H); flash *= 0.88; }
+}
+
+// ---- 마우스/터치 슬링샷: 아무 데나 누르면 토마토를 집어오고, 당겼다 놓으면 반대쪽 벽으로 ----
+let drag = null;
+canvas.addEventListener('pointerdown', e => {
+  initAudio();
+  if (ball.phase !== 'idle' || Math.hypot(e.clientX - project(ball).X, e.clientY - project(ball).Y) > R * 2.5) {
+    Object.assign(ball, { phase: 'idle', z: IDLE_Z, vx: 0, vy: 0, vz: 0 });
+    placeAtScreen(ball, e.clientX, e.clientY);
+  }
+  const p = project(ball);
+  drag = { ax: p.X, ay: p.Y };
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  let dx = e.clientX - drag.ax, dy = e.clientY - drag.ay;
+  const d = Math.hypot(dx, dy);
+  if (d > MAX_PULL) { dx *= MAX_PULL / d; dy *= MAX_PULL / d; }
+  placeAtScreen(ball, drag.ax + dx, drag.ay + dy);
+});
+canvas.addEventListener('pointerup', () => {
+  if (!drag) return;
+  const p = project(ball), dx = p.X - drag.ax, dy = p.Y - drag.ay, pull = Math.hypot(dx, dy);
+  drag = null;
+  if (pull < 10) return; // 그냥 클릭은 던지지 않음
+  throwBall(-dx * AIM, -dy * AIM, pull * PULL_POWER);
+});
+
+// ---- 손 모션 (MediaPipe HandLandmarker) ----
+const hand = { visible: false, fist: false, x: 0, y: 0, hist: [] };
+let landmarker = null;
+const video = document.getElementById('video');
+let lastVideoTime = -1;
+
+document.getElementById('wipe').onclick = () => { wipeX = -30; };
+addEventListener('keydown', e => { if (e.key === 'c' || e.key === 'C') wipeX = -30; });
+document.getElementById('reset').onclick = () => { drag = null; reset(); drops.length = drips.length = 0; sctx.clearRect(0, 0, W, H); };
+document.getElementById('cam').onclick = async function () {
+  initAudio();
+  this.disabled = true; msg.textContent = '손 인식 모델 불러오는 중…';
+  try {
+    const V = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+    const { FilesetResolver, HandLandmarker } = await import(V + '/vision_bundle.mjs');
+    const fileset = await FilesetResolver.forVisionTasks(V + '/wasm');
+    landmarker = await HandLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO', numHands: 1,
+    });
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    video.style.display = 'block';
+    this.textContent = '카메라 켜짐';
+    msg.textContent = '주먹 쥐어 잡기 → 팔을 휘두르며 손 펴서 던지기';
+  } catch (err) {
+    console.error(err);
+    this.disabled = false;
+    msg.textContent = '카메라를 쓸 수 없어요 — 마우스로 던지세요 (' + err.name + ')';
+  }
+};
+
+const d2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function updateHand() {
+  if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const lm = landmarker.detectForVideo(video, performance.now()).landmarks[0];
+  if (!lm) {
+    hand.visible = false;
+    // 세게 휘두르면 손이 흐려져 인식이 끊김 → 놓친 게 아니라 던진 것으로 처리
+    if (ball.phase === 'held') {
+      const t = performance.now() / 1000;
+      const peak = hand.hist.filter(h => t - h.t < SWING_WINDOW).reduce((m, h) => h.speed > m.speed ? h : m, { speed: 0, vx: 0, vy: 0 });
+      if (peak.speed > 800) throwBall(peak.vx * 0.15, peak.vy * 0.15, peak.speed * THROW_GAIN);
+      else ball.phase = 'idle';
+    }
+    hand.hist.length = 0; hand.fist = false;
+    return;
+  }
+  const t = performance.now() / 1000;
+  hand.visible = true;
+  hand.x = (1 - (lm[0].x + lm[9].x) / 2) * W; // 셀피라 좌우 반전
+  hand.y = ((lm[0].y + lm[9].y) / 2) * H;
+  const curl = [8, 12, 16, 20].reduce((s, i) => s + d2(lm[i], lm[0]), 0) / 4 / d2(lm[0], lm[9]);
+  const wasFist = hand.fist;
+  hand.fist = wasFist ? curl < FIST_OFF : curl < FIST_ON;
+
+  // 팔 속도: 최근 3프레임. 화면 위 움직임 + 카메라 쪽으로 다가오는 속도(손 크기 증가)
+  const cur = { x: hand.x, y: hand.y, size: Math.log(d2(lm[0], lm[9])), t, speed: 0, vx: 0, vy: 0 };
+  const a = hand.hist[hand.hist.length - 3];
+  if (a) {
+    const dt = Math.max(t - a.t, 1 / 60);
+    cur.vx = (cur.x - a.x) / dt; cur.vy = (cur.y - a.y) / dt;
+    cur.speed = Math.hypot(cur.vx, cur.vy, Math.max(0, (cur.size - a.size) / dt * Z_GAIN));
+  }
+  hand.hist.push(cur);
+  if (hand.hist.length > 12) hand.hist.shift();
+
+  if (drag) return; // 마우스 조작 중이면 손은 무시
+  if (hand.fist && !wasFist && ball.phase !== 'flying') { // 주먹 = 잡기
+    Object.assign(ball, { phase: 'held', z: IDLE_Z, vx: 0, vy: 0, vz: 0 });
+    placeAtScreen(ball, hand.x, hand.y);
+  }
+  if (!hand.fist && wasFist && ball.phase === 'held') { // 손 펴기 = 던지기, 힘은 직전 팔 스윙의 최고 속도
+    const peak = hand.hist.filter(h => t - h.t < SWING_WINDOW).reduce((m, h) => h.speed > m.speed ? h : m, cur);
+    throwBall(peak.vx * 0.15, peak.vy * 0.15, peak.speed * THROW_GAIN);
+  }
+}
+
+// 들고 있는 동안 보여줄 현재 파워 (0~1)
+function swingPower() {
+  const t = performance.now() / 1000;
+  const peak = Math.max(0, ...hand.hist.filter(h => t - h.t < SWING_WINDOW).map(h => h.speed));
+  return Math.min(peak * THROW_GAIN / (1 / IMPACT_K), 1);
+}
+
+// ---- 루프 ----
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 1 / 30); last = now;
+  updateHand();
+  if (ball.phase === 'held' && hand.visible) { // 손 따라오기
+    const p = project(ball);
+    placeAtScreen(ball, p.X + (hand.x - p.X) * 0.5, p.Y + (hand.y - p.Y) * 0.5);
+  }
+  step(ball, dt);
+  updateJuice(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---- 자가 점검: ?test ----
+if (location.search.includes('test')) {
+  const b = { x: 300, y: 300, z: IDLE_Z, vx: 0, vy: 0, vz: -2600, phase: 'flying', t: 0, amp: 0, noise: [], bubbles: [] };
+  for (let i = 0; i < 30 && b.phase === 'flying'; i++) step(b, 1 / 60);
+  console.assert(b.phase === 'stuck', 'should stick to wall');
+  for (let i = 0; i < 12; i++) step(b, 1 / 60);
+  console.assert(splatAmount(b) > 0.8, 'strong throw spreads wide', splatAmount(b));
+  for (let i = 0; i < 300; i++) step(b, 1 / 60);
+  console.assert(splatAmount(b) < 0.05, 'recovers in ~5s', splatAmount(b));
+  console.log('self-check done, amount after 5s =', splatAmount(b).toFixed(4));
+}
+</script>
+</body>
+</html>
