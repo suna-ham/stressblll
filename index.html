@@ -3,7 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>토마토 스트레스볼</title>
+<title>토마토 스트레스볼 — 던지면 촤악, 3초 뒤 복구</title>
+<meta name="description" content="설치 없이 브라우저에서. 손 모션이나 마우스로 젤리 토마토를 벽에 던지세요. 월요일, 야근, 원하는 단어를 써서 던질 수 있어요.">
+<meta property="og:title" content="토마토 스트레스볼 🍅💥">
+<meta property="og:description" content="던지면 촤악 퍼졌다가 3초 뒤 원래대로. 스트레스 받는 단어를 써서 던져보세요.">
+<meta property="og:image" content="https://suna-ham.github.io/stressblll/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #9a9a96; font-family: system-ui, sans-serif; }
   canvas { display: block; touch-action: none; }
@@ -20,6 +25,7 @@
   <button id="cam">카메라 켜기</button>
   <button id="reset">리셋</button>
   <button id="wipe">🧽 벽 닦기</button>
+  <input id="word" maxlength="6" placeholder="던질 단어 (예: 야근)" style="font:inherit;padding:7px 12px;border-radius:999px;border:0;width:150px">
   <span id="msg">토마토를 잡고 아래로 당겼다 놓으면 벽으로 날아가요</span>
 </div>
 <div id="impact"></div>
@@ -280,6 +286,14 @@ function drawTomato(X, Y, s, amt, b) {
   ctx.fillRect(...box);
   ctx.restore();
   drawStem(X, Y, s);
+  if (word) { // 토마토에 쓴 단어: 퍼지면 같이 늘어남
+    ctx.save(); ctx.translate(X, Y + rr * 0.45); ctx.scale(1 + amt * SPREAD * 0.7, 1 + amt * SPREAD * 0.4);
+    ctx.font = `900 ${Math.min(rr * 0.42, rr * 1.6 / word.length)}px system-ui, sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+    ctx.lineWidth = rr * 0.06; ctx.strokeStyle = 'rgba(90,0,0,.7)'; ctx.strokeText(word, 0, 0);
+    ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.fillText(word, 0, 0);
+    ctx.restore();
+  }
 }
 
 function drawStem(X, Y, s) { // 꼭지는 위에서 본 모양, 퍼지지 않음
@@ -375,6 +389,16 @@ let landmarker = null;
 const video = document.getElementById('video');
 let lastVideoTime = -1;
 
+// 단어: ?word=야근 링크로 공유 가능
+let word = (new URLSearchParams(location.search).get('word') || '').slice(0, 6);
+const wordEl = document.getElementById('word');
+wordEl.value = word;
+wordEl.oninput = () => {
+  word = wordEl.value.trim().slice(0, 6);
+  const u = new URL(location); word ? u.searchParams.set('word', word) : u.searchParams.delete('word');
+  history.replaceState(null, '', u);
+};
+wordEl.onkeydown = e => e.stopPropagation(); // 입력 중 C키가 벽 닦기로 가지 않게
 document.getElementById('wipe').onclick = () => { wipeX = -30; };
 addEventListener('keydown', e => { if (e.key === 'c' || e.key === 'C') wipeX = -30; });
 document.getElementById('reset').onclick = () => { drag = null; reset(); drops.length = drips.length = 0; sctx.clearRect(0, 0, W, H); };
